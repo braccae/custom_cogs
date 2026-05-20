@@ -86,12 +86,21 @@ def _apply_dave_monkeypatch():
                 except Exception as e:
                     import time as _time
                     now = _time.monotonic()
-                    if not hasattr(self, '_last_opus_err') or (now - self._last_opus_err) > 10.0:
-                        self._last_opus_err = now
-                        log.warning("Opus decode failed (pkt#%d, dave=%s, orig=%d, stripped=%d): %s",
-                                    self._diag_count, dave_result,
-                                    len(packet.decrypted_data) if packet.decrypted_data else 0,
-                                    len(data) if data else 0, e)
+                    is_dave_err = dave_result.startswith("err:") or dave_result.startswith("unencrypted_err:")
+                    if is_dave_err:
+                        # DAVE E2EE is not ready or has temporary decryption issues. This is expected.
+                        if not hasattr(self, '_last_dave_err') or (now - self._last_dave_err) > 30.0:
+                            self._last_dave_err = now
+                            log.debug("DAVE decryption not ready, returning silence (pkt#%d, dave=%s, orig=%d): %s",
+                                      self._diag_count, dave_result,
+                                      len(packet.decrypted_data) if packet.decrypted_data else 0, e)
+                    else:
+                        if not hasattr(self, '_last_opus_err') or (now - self._last_opus_err) > 10.0:
+                            self._last_opus_err = now
+                            log.warning("Opus decode failed (pkt#%d, dave=%s, orig=%d, stripped=%d): %s",
+                                        self._diag_count, dave_result,
+                                        len(packet.decrypted_data) if packet.decrypted_data else 0,
+                                        len(data) if data else 0, e)
                     # Return silence frame
                     return packet, b'\x00' * 3840
             
@@ -225,6 +234,9 @@ class GeminiVoice(commands.Cog):
         
         # Apply monkeypatch on every cog load/reload
         _apply_dave_monkeypatch()
+        
+        # Reduce spam from voice_recv reader logger
+        logging.getLogger("discord.ext.voice_recv").setLevel(logging.WARNING)
 
     def cog_unload(self):
         log.info("Unloading GeminiVoice cog: cancelling active tasks...")
@@ -335,6 +347,14 @@ class GeminiVoice(commands.Cog):
                                 received_any = True
                                 server_content = response.server_content
                                 if server_content:
+                                    if server_content.interrupted:
+                                        log.info("Gemini response was interrupted by user speech.")
+                                        if voice_client.is_playing():
+                                            try:
+                                                voice_client.stop_playing()
+                                            except Exception:
+                                                log.exception("Error stopping voice playback on interruption:")
+                                        audio_buffer.buffer.clear()
                                     if server_content.model_turn:
                                         for part in server_content.model_turn.parts:
                                             if part.inline_data and part.inline_data.data:
