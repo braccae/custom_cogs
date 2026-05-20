@@ -3,7 +3,8 @@
 Welcome to the **Custom Cogs** repository for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot). This repository hosts a collection of specialized cogs designed to extend your bot's capabilities.
 
 Currently, this repository features:
-* **GeminiVoice**: A high-performance, real-time voice assistant utilizing the Gemini Multimodal Live API to talk and listen directly in voice channels.
+* **GeminiVoice**: A high-performance, real-time voice assistant utilizing the Gemini Multimodal Live API to talk and listen directly in voice channels. 
+# Currently does not work due to DAVE E2EE implementation and voice-recv support for it.
 
 ---
 

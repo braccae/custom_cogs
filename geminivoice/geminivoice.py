@@ -1,4 +1,5 @@
 import asyncio
+import queue
 import io
 import discord
 from discord import app_commands
@@ -11,191 +12,202 @@ import logging
 
 log = logging.getLogger("red.geminivoice")
 
-# Store reference to the true original _decode_packet (before any monkeypatching)
-_ORIGINAL_DECODE_PACKET = None
-
-def _apply_dave_monkeypatch():
-    """Apply DAVE E2EE monkeypatch to voice_recv. Safe to call multiple times."""
-    global _ORIGINAL_DECODE_PACKET
+def _restore_original_voice_recv():
+    """Restores the original _decode_packet method to discord-ext-voice-recv if reloaded."""
     try:
-        import davey
+        import importlib
         import discord.ext.voice_recv.opus as voice_recv_opus
-        from discord.ext.voice_recv.rtp import FakePacket
-        
-        def patched_decode_packet(self, packet):
-            """Direct replacement for PacketDecoder._decode_packet.
-            Handles DAVE supplemental byte stripping inline instead of wrapping."""
-            assert self._decoder is not None
-            
-            if not hasattr(self, '_dave_conn'):
-                self._dave_conn = None
-            if not hasattr(self, '_dave_uid'):
-                self._dave_uid = None
-            if not hasattr(self, '_diag_count'):
-                self._diag_count = 0
+        importlib.reload(voice_recv_opus)
+        log.info("Restored original discord.ext.voice_recv.opus implementation (no monkeypatches).")
+    except Exception:
+        log.exception("Failed to restore original voice_recv:")
 
-            # Real packet path
-            if packet:
-                # Try to cache DAVE connection on first real packet
-                if self._dave_conn is None:
-                    if hasattr(self, 'sink') and self.sink:
-                        vc = getattr(self.sink, 'voice_client', None)
-                        if vc:
-                            conn = getattr(vc, '_connection', None)
-                            if conn:
-                                self._dave_conn = conn
-                                uid = vc._get_id_from_ssrc(self.ssrc)
-                                if uid:
-                                    self._dave_uid = uid
-                                    log.info(f"Cached DAVE conn for ssrc={self.ssrc}, uid={uid}")
-
-                # Try DAVE decrypt first, or fallback to stripping
-                data = packet.decrypted_data
-                dave_result = "skip"
-                if data and self._dave_conn and self._dave_uid and hasattr(self._dave_conn, 'dave_session') and self._dave_conn.dave_session and self._dave_conn.dave_session.ready:
-                    try:
-                        decrypted = self._dave_conn.dave_session.decrypt(self._dave_uid, davey.MediaType.audio, bytes(data))
-                        data = decrypted
-                        dave_result = "decrypted"
-                    except Exception as e:
-                        err_str = str(e)
-                        if 'Unencrypted' in err_str or 'Passthrough' in err_str:
-                            # It's already pure Opus audio without DAVE framing!
-                            # Do not strip any bytes, or else we corrupt the Opus frame.
-                            dave_result = f"unencrypted_err:{err_str[:20]}"
-                        else:
-                            dave_result = f"err:{err_str[:40]}"
-                elif data and len(data) > 1:
-                    # Fallback stripping if DAVE is completely unavailable
-                    supp_len = data[-1]
-                    strip_total = supp_len + 1
-                    if 0 < strip_total < len(data):
-                        data = data[:-strip_total]
-                        dave_result = f"fallback_stripped_{strip_total}"
-                
-                # Diagnostic logging
-                self._diag_count += 1
-                if self._diag_count <= 5 or self._diag_count % 500 == 0:
-                    orig_len = len(packet.decrypted_data) if packet.decrypted_data else 0
-                    new_len = len(data) if data else 0
-                    log.info(f"DIAG pkt#{self._diag_count} seq={packet.sequence} orig={orig_len} stripped={new_len} dave={dave_result}")
-
-                try:
-                    pcm = self._decoder.decode(data, fec=False)
-                    return packet, pcm
-                except Exception as e:
-                    import time as _time
-                    now = _time.monotonic()
-                    is_dave_err = dave_result.startswith("err:") or dave_result.startswith("unencrypted_err:")
-                    if is_dave_err:
-                        # DAVE E2EE is not ready or has temporary decryption issues. This is expected.
-                        if not hasattr(self, '_last_dave_err') or (now - self._last_dave_err) > 30.0:
-                            self._last_dave_err = now
-                            log.debug("DAVE decryption not ready, returning silence (pkt#%d, dave=%s, orig=%d): %s",
-                                      self._diag_count, dave_result,
-                                      len(packet.decrypted_data) if packet.decrypted_data else 0, e)
-                    else:
-                        if not hasattr(self, '_last_opus_err') or (now - self._last_opus_err) > 10.0:
-                            self._last_opus_err = now
-                            log.warning("Opus decode failed (pkt#%d, dave=%s, orig=%d, stripped=%d): %s",
-                                        self._diag_count, dave_result,
-                                        len(packet.decrypted_data) if packet.decrypted_data else 0,
-                                        len(data) if data else 0, e)
-                    # Return silence frame
-                    return packet, b'\x00' * 3840
-            
-            # Fake packet path - use FEC from next packet
-            self._diag_count += 1
-            next_packet = self._buffer.peek_next()
-            if next_packet is not None:
-                nextdata = next_packet.decrypted_data
-                # Also strip DAVE bytes from FEC source
-                if nextdata and len(nextdata) > 1:
-                    supp_len = nextdata[-1]
-                    strip_total = supp_len + 1
-                    if 0 < strip_total < len(nextdata):
-                        nextdata = nextdata[:-strip_total]
-                try:
-                    pcm = self._decoder.decode(nextdata, fec=True)
-                except Exception:
-                    pcm = self._decoder.decode(None, fec=False)
-            else:
-                pcm = self._decoder.decode(None, fec=False)
-            
-            return packet, pcm
-        
-        patched_decode_packet._is_dave_patch = True
-        voice_recv_opus.PacketDecoder._decode_packet = patched_decode_packet
-        log.info("Applied DAVE stripping monkeypatch to discord.ext.voice_recv")
-    except Exception as e:
-        log.exception("Failed to apply DAVE monkeypatch:")
 
 
 class GeminiVoiceSink(voice_recv.AudioSink):
+    """Sink that receives Opus audio from voice_recv and streams PCM to Gemini Live API.
+    
+    Uses wants_opus()=True because voice_recv's internal decoder crashes
+    (unhandled OpusError) on DAVE-supplemented packets. We handle Opus
+    decoding ourselves with proper error recovery.
+    
+    All decoded audio is streamed to Gemini continuously — Gemini's 
+    server-side VAD handles speech detection and turn-taking.
+    """
+    
     def __init__(self, session, loop):
         super().__init__()
         self.session = session
         self.loop = loop
         self._send_count = 0
         self._last_send_log = 0
-        self._last_speech_time = 0
-        self._is_speaking = False
+        self.decoders = {}
+        self._consecutive_errors = {}  # Track consecutive decode failures per SSRC
+        self.audio_queue = queue.Queue()
+        self.sender_task = asyncio.run_coroutine_threadsafe(self._sender_loop(), self.loop)
         
     def wants_opus(self) -> bool:
-        return False
+        return True
+
+    def _strip_dave_supplemental(self, opus_data):
+        """Strip DAVE supplemental data from Opus payload.
+        
+        DAVE appends supplemental data with a 1-byte length suffix.
+        The last byte indicates how many supplemental bytes (including itself)
+        to remove. We validate the suffix is reasonable before stripping.
+        """
+        if not opus_data or len(opus_data) < 2:
+            return opus_data
+            
+        supp_len = opus_data[-1]
+        # The supplemental section is supp_len bytes + 1 byte for the length itself
+        strip_total = supp_len + 1
+        
+        # Only strip if it's a plausible supplemental data size
+        # (typically small, and must leave some actual opus data)
+        if 1 <= strip_total < len(opus_data) and strip_total <= 20:
+            return opus_data[:-strip_total]
+        
+        return opus_data
 
     def write(self, user, data):
-        if self.session and data.pcm:
-            self._send_count += 1
-            # Use RMS to detect actual audio energy
+        opus_data = data.opus
+        if not opus_data:
+            return
+
+        if not self.session:
+            return
+
+        ssrc = data.packet.ssrc
+        
+        # Skip FakePackets (packet loss concealment)
+        if data.packet.__class__.__name__ == 'FakePacket':
+            return
+
+        # Get or create decoder for this SSRC
+        if ssrc not in self.decoders:
             try:
-                rms = audioop.rms(data.pcm, 2)
+                self.decoders[ssrc] = discord.opus.Decoder()
+                self._consecutive_errors[ssrc] = 0
+            except Exception:
+                log.exception(f"Failed to create Opus decoder for SSRC {ssrc}")
+                return
+                
+        decoder = self.decoders[ssrc]
+        
+        # Try decoding the raw opus data first (works when DAVE is not active)
+        pcm = None
+        try:
+            pcm = decoder.decode(opus_data, fec=False)
+            self._consecutive_errors[ssrc] = 0
+        except Exception:
+            # Raw decode failed — try stripping DAVE supplemental data
+            stripped = self._strip_dave_supplemental(opus_data)
+            if stripped != opus_data:
+                try:
+                    pcm = decoder.decode(stripped, fec=False)
+                    self._consecutive_errors[ssrc] = 0
+                except Exception:
+                    pass
+            
+            if pcm is None:
+                self._consecutive_errors[ssrc] = self._consecutive_errors.get(ssrc, 0) + 1
+                
+                # If we've had many consecutive errors, the decoder state is likely
+                # corrupted. Reset it so future valid frames can succeed.
+                if self._consecutive_errors[ssrc] >= 10:
+                    import time as _time
+                    now = _time.monotonic()
+                    if not hasattr(self, '_last_reset_log') or (now - self._last_reset_log) > 5.0:
+                        self._last_reset_log = now
+                        log.warning(f"Resetting Opus decoder for SSRC {ssrc} after {self._consecutive_errors[ssrc]} consecutive errors")
+                    try:
+                        self.decoders[ssrc] = discord.opus.Decoder()
+                        self._consecutive_errors[ssrc] = 0
+                    except Exception:
+                        pass
+                return  # Drop this frame entirely rather than sending silence
+
+        self._send_count += 1
+
+        import time as _time
+        now = _time.monotonic()
+
+        if now - self._last_send_log > 5.0:
+            self._last_send_log = now
+            try:
+                rms = audioop.rms(pcm, 2)
             except Exception:
                 rms = 0
+            log.info(f"Sink.write: {self._send_count} calls in 5s, rms={rms}, user={user}")
+            self._send_count = 0
+
+        # Send all successfully decoded audio to Gemini
+        self.audio_queue.put(pcm)
             
-            import time as _time
-            now = _time.monotonic()
-            
-            # Track speech state for sending trailing silence
-            if rms > 30:  # Speech threshold (low to catch quiet speech)
-                self._last_speech_time = now
-                self._is_speaking = True
-            
-            if now - self._last_send_log > 5.0:
-                self._last_send_log = now
-                log.info(f"Sink.write: {self._send_count} calls in 5s, rms={rms}, speaking={self._is_speaking}, user={user}")
-                self._send_count = 0
-            
-            # Only send to Gemini if there's speech or we're within 1 second of last speech
-            # (trailing silence helps Gemini detect end of utterance)
-            if self._is_speaking:
-                if rms <= 30 and (now - self._last_speech_time) > 1.0:
-                    self._is_speaking = False
-                    log.info("Speech ended, stopping audio send to Gemini")
-                else:
-                    asyncio.run_coroutine_threadsafe(
-                        self._send_audio(data.pcm),
-                        self.loop
+    async def _sender_loop(self):
+        import time
+        log.info("Gemini Live audio sender loop started.")
+        buffer = bytearray()
+        last_data_time = time.monotonic()
+        send_count = 0
+        last_send_log = time.monotonic()
+        
+        while True:
+            try:
+                try:
+                    pcm_data = self.audio_queue.get_nowait()
+                    buffer.extend(pcm_data)
+                    last_data_time = time.monotonic()
+                except queue.Empty:
+                    # Flush buffer if we have unsent audio and no new audio for 50ms
+                    if len(buffer) > 0 and (time.monotonic() - last_data_time) > 0.05:
+                        chunk = bytes(buffer)
+                        buffer.clear()
+                        mono = audioop.tomono(chunk, 2, 0.5, 0.5)
+                        resampled, _ = audioop.ratecv(mono, 2, 1, 48000, 16000, None)
+                        await self.session.send_realtime_input(
+                            media=types.Blob(
+                                data=resampled,
+                                mime_type="audio/pcm;rate=16000"
+                            )
+                        )
+                        send_count += 1
+                    await asyncio.sleep(0.01)
+                    continue
+                
+                # Send 100ms chunks (19200 bytes for 48000Hz stereo PCM)
+                while len(buffer) >= 19200:
+                    chunk = bytes(buffer[:19200])
+                    del buffer[:19200]
+                    mono = audioop.tomono(chunk, 2, 0.5, 0.5)
+                    resampled, _ = audioop.ratecv(mono, 2, 1, 48000, 16000, None)
+                    await self.session.send_realtime_input(
+                        media=types.Blob(
+                            data=resampled,
+                            mime_type="audio/pcm;rate=16000"
+                        )
                     )
-            
-    async def _send_audio(self, pcm_data):
-        try:
-            # Convert stereo to mono (using 0.5, 0.5 to avoid clipping)
-            mono = audioop.tomono(pcm_data, 2, 0.5, 0.5)
-            # Downsample 48000 to 16000
-            resampled, _ = audioop.ratecv(mono, 2, 1, 48000, 16000, None)
-            
-            await self.session.send_realtime_input(
-                media=types.Blob(
-                    data=resampled,
-                    mime_type="audio/pcm;rate=16000"
-                )
-            )
-        except Exception as e:
-            log.exception("Error sending audio to Gemini Live API:")
+                    send_count += 1
+
+                # Periodic log of sender activity
+                now = time.monotonic()
+                if now - last_send_log > 5.0:
+                    last_send_log = now
+                    log.info(f"Sender loop: {send_count} chunks sent in last 5s, queue_size={self.audio_queue.qsize()}")
+                    send_count = 0
+
+            except asyncio.CancelledError:
+                log.info("Gemini Live audio sender loop cancelled.")
+                break
+            except Exception:
+                log.exception("Error in Gemini Live audio sender loop:")
+                await asyncio.sleep(0.1)
 
     def cleanup(self):
-        pass
+        self.decoders.clear()
+        if self.sender_task:
+            self.sender_task.cancel()
 
 
 class RawAudioBuffer(discord.AudioSource):
@@ -219,6 +231,10 @@ class RawAudioBuffer(discord.AudioSource):
         self.empty_count = 0
         self.buffer.extend(data)
 
+    def interrupt(self):
+        self.buffer.clear()
+        self.empty_count = 80
+
 
 class GeminiVoice(commands.Cog):
     """Voice assistant cog using Gemini Multimodal Live API."""
@@ -232,8 +248,8 @@ class GeminiVoice(commands.Cog):
         self.active_tasks = {}
         self.audio_sources = {}
         
-        # Apply monkeypatch on every cog load/reload
-        _apply_dave_monkeypatch()
+        # Ensure we restore original voice_recv library implementation (no monkeypatches)
+        _restore_original_voice_recv()
         
         # Reduce spam from voice_recv reader logger
         logging.getLogger("discord.ext.voice_recv").setLevel(logging.WARNING)
@@ -349,12 +365,7 @@ class GeminiVoice(commands.Cog):
                                 if server_content:
                                     if server_content.interrupted:
                                         log.info("Gemini response was interrupted by user speech.")
-                                        if voice_client.is_playing():
-                                            try:
-                                                voice_client.stop_playing()
-                                            except Exception:
-                                                log.exception("Error stopping voice playback on interruption:")
-                                        audio_buffer.buffer.clear()
+                                        audio_buffer.interrupt()
                                     if server_content.model_turn:
                                         for part in server_content.model_turn.parts:
                                             if part.inline_data and part.inline_data.data:

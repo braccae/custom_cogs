@@ -2,6 +2,8 @@
 
 A Discord Red-Bot cog that joins a voice channel, listens to voice inputs, and responds in real-time using the **Gemini Multimodal Live API**.
 
+
+# Currently does not work due to DAVE E2EE implementation and voice-recv support for it.
 ---
 
 ## ✨ Features
