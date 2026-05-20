@@ -44,12 +44,12 @@ Once installed, load the cog into your running instance:
 If the `Downloader` fails to automatically install the required dependencies (or if you are running in a restricted environment), you can install them manually via Red's internal pip manager:
 
 ```text
-[p]pipinstall google-genai discord-ext-voicerecv
+[p]pip install google-genai discord-ext-voice-recv
 ```
 
 Alternatively, from your server shell (with the Red virtual environment activated):
 ```bash
-pip install google-genai discord-ext-voicerecv
+pip install google-genai discord-ext-voice-recv
 ```
 
 ---

@@ -18,11 +18,11 @@ A Discord Red-Bot cog that joins a voice channel, listens to voice inputs, and r
 Before loading `GeminiVoice`, verify that you have installed the required python dependencies:
 
 1. **`google-genai`**: The official Google GenAI SDK.
-2. **`discord-ext-voicerecv`**: Allows the bot to receive voice data from voice channels.
+2. **`discord-ext-voice-recv`**: Allows the bot to receive voice data from voice channels.
 
 You can install them by running:
 ```text
-[p]pipinstall google-genai discord-ext-voicerecv
+[p]pipinstall google-genai discord-ext-voice-recv
 ```
 
 ---

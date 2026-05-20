@@ -1,11 +1,11 @@
 {
     "author": ["Antigravity"],
-    "install_msg": "Thanks for installing GeminiVoice! Ensure you have `discord-ext-voicerecv` and `google-genai` installed.",
+    "install_msg": "Thanks for installing GeminiVoice! Ensure you have `discord-ext-voice-recv` and `google-genai` installed.",
     "name": "GeminiVoice",
     "short": "Gemini Multimodal Live API voice assistant.",
     "description": "A cog that joins a voice channel, listens for 'hey gemini', and talks to users using the Gemini Live API.",
     "tags": ["voice", "gemini", "live", "ai"],
-    "requirements": ["google-genai", "discord-ext-voicerecv"],
+    "requirements": ["google-genai", "discord-ext-voice-recv"],
     "hidden": false,
     "type": "COG"
 }
