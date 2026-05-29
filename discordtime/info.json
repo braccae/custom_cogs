@@ -1,0 +1,11 @@
+{
+    "author": ["Antigravity"],
+    "install_msg": "Thanks for installing DiscordTime! Use /settz to set your timezone and /time to generate Discord timestamps.",
+    "name": "DiscordTime",
+    "short": "Convert custom times to universal Discord timestamps.",
+    "description": "A cog that interprets user-input times in their custom timezone and generates Discord copy-pasteable timestamps.",
+    "tags": ["time", "timezone", "utility", "discord"],
+    "requirements": ["python-dateutil"],
+    "hidden": false,
+    "type": "COG"
+}
